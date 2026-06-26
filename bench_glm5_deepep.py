@@ -29,7 +29,7 @@ Usage:
 
   # 4 节点，每个节点执行（指定各自的 node-rank）
   # Node 0:
-  python bench_glm5_deepep_dispatch.py --nnodes 4 --node-rank 0 --master-addr 10.0.0.1 --m-per-gpu 4096
+  python bench_glm5_deepep_dispatch.py --nnodes 2 --node-rank 0 --master-addr 10.227.27.245 --m-per-gpu 4096
   # Node 1:
   python bench_glm5_deepep_dispatch.py --nnodes 4 --node-rank 1 --master-addr 10.0.0.1 --m-per-gpu 4096
 
@@ -56,6 +56,9 @@ HIDDEN_SIZE = 6144
 NUM_EXPERTS = 256
 NUM_TOPK = 8
 NUM_TOPK_GROUPS = 4  # n_group from config (grouped topk routing)
+
+# Tokens per GPU to benchmark
+M_PER_GPU_LIST = [512, 1024, 2048, 4096, 8192, 16384]
 
 NUM_WARMUP = 10
 NUM_RUNS = 30
@@ -288,12 +291,15 @@ def worker(local_rank, num_local_ranks, args):
     device = torch.device("cuda", local_rank)
 
     # Create DeepEP buffer
+    # low_latency_mode=True for single-node (num_ranks <= 8, NVLink only)
+    # low_latency_mode=False for multi-node (num_ranks > 8, uses RDMA)
     num_qps_per_rank = args.num_sms // 2
+    use_low_latency = (world_size <= 8)
     buffer = deep_ep.Buffer(
         group,
         int(1e9),  # RDMA buffer
         int(1e9),  # NVL buffer
-        low_latency_mode=False,
+        low_latency_mode=use_low_latency,
         num_qps_per_rank=num_qps_per_rank,
     )
 
@@ -301,7 +307,6 @@ def worker(local_rank, num_local_ranks, args):
     rdma_buffer_size = 128
     config = deep_ep.Config(args.num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
 
-    num_tokens = args.m_per_gpu
     hidden = args.hidden
     num_experts = NUM_EXPERTS
 
@@ -321,52 +326,54 @@ def worker(local_rank, num_local_ranks, args):
         print("=" * 120)
         print(f"Cluster:   {num_nodes} nodes × {num_local_ranks} GPUs = {world_size} ranks")
         print(f"Model:     hidden={hidden}, experts={num_experts}, top_k={NUM_TOPK}")
-        print(f"Per GPU:   M={num_tokens} tokens, experts_per_gpu={num_experts // world_size}")
+        print(f"M/GPU:     {M_PER_GPU_LIST}")
+        print(f"Per GPU:   experts_per_gpu={num_experts // world_size}")
         print(f"FP8:       {args.use_fp8}")
-        print(f"DeepEP:    num_sms={args.num_sms}")
+        print(f"DeepEP:    num_sms={args.num_sms}, low_latency={use_low_latency}")
         print(f"Scenarios: {list(scenarios.keys())}")
         print("=" * 120, flush=True)
 
     all_results = []
 
-    for scenario_name, skew_std in scenarios.items():
-        dist.barrier(group=group)
+    for num_tokens in M_PER_GPU_LIST:
+        for scenario_name, skew_std in scenarios.items():
+            dist.barrier(group=group)
 
-        if skew_std == 0.0:
-            topk_idx, topk_weights, scores = generate_routing_uniform(
-                num_tokens, num_experts, NUM_TOPK, device)
-        else:
-            topk_idx, topk_weights, scores = generate_routing_skewed(
-                num_tokens, num_experts, NUM_TOPK, skew_std, device)
+            if skew_std == 0.0:
+                topk_idx, topk_weights, scores = generate_routing_uniform(
+                    num_tokens, num_experts, NUM_TOPK, device)
+            else:
+                topk_idx, topk_weights, scores = generate_routing_skewed(
+                    num_tokens, num_experts, NUM_TOPK, skew_std, device)
 
-        result = run_dispatch_bench(
-            rank, world_size, num_nodes, num_local_ranks,
-            buffer, group, config,
-            num_tokens, hidden, topk_idx, topk_weights, scores,
-            args.use_fp8, scenario_name,
-        )
-        all_results.append(result)
+            result = run_dispatch_bench(
+                rank, world_size, num_nodes, num_local_ranks,
+                buffer, group, config,
+                num_tokens, hidden, topk_idx, topk_weights, scores,
+                args.use_fp8, scenario_name,
+            )
+            all_results.append(result)
 
-        if rank == 0:
-            print(f"\n--- Scenario: {scenario_name} (skew_std={skew_std}) ---")
-            print(f"  layout:   {result['layout_ms']:.3f} ms")
-            print(f"  dispatch: {result['dispatch_ms']:.3f} ms")
-            print(f"  combine:  {result['combine_ms']:.3f} ms")
-            print(f"  total:    {result['total_ms']:.3f} ms")
-            print(f"  recv_tokens: {result['recv_tokens']}")
-            print(f"  local expert load: min={result['expert_count_min']}, "
-                  f"max={result['expert_count_max']}, avg={result['expert_count_avg']:.0f}", flush=True)
+            if rank == 0:
+                print(f"\n--- M={num_tokens}, Scenario: {scenario_name} (skew_std={skew_std}) ---")
+                print(f"  layout:   {result['layout_ms']:.3f} ms")
+                print(f"  dispatch: {result['dispatch_ms']:.3f} ms")
+                print(f"  combine:  {result['combine_ms']:.3f} ms")
+                print(f"  total:    {result['total_ms']:.3f} ms")
+                print(f"  recv_tokens: {result['recv_tokens']}")
+                print(f"  local expert load: min={result['expert_count_min']}, "
+                      f"max={result['expert_count_max']}, avg={result['expert_count_avg']:.0f}", flush=True)
 
     # ── Summary table (rank 0 only) ──
     if rank == 0:
-        print(f"\n{'='*100}")
-        print("  Summary: DeepEP dispatch latency by scenario")
-        print(f"{'='*100}")
-        print(f"  {'scenario':<12s} {'layout(ms)':>12s} {'dispatch(ms)':>14s} {'combine(ms)':>13s} "
+        print(f"\n{'='*120}")
+        print("  Summary: DeepEP dispatch latency by M and scenario")
+        print(f"{'='*120}")
+        print(f"  {'M':>8s} {'scenario':<12s} {'layout(ms)':>12s} {'dispatch(ms)':>14s} {'combine(ms)':>13s} "
               f"{'total(ms)':>12s} {'recv_tok':>10s} {'exp_min':>9s} {'exp_max':>9s} {'exp_avg':>9s}")
-        print(f"  {'-'*96}")
+        print(f"  {'-'*104}")
         for r in all_results:
-            print(f"  {r['scenario']:<12s} {r['layout_ms']:>12.3f} {r['dispatch_ms']:>14.3f} "
+            print(f"  {r['num_tokens']:>8d} {r['scenario']:<12s} {r['layout_ms']:>12.3f} {r['dispatch_ms']:>14.3f} "
                   f"{r['combine_ms']:>13.3f} {r['total_ms']:>12.3f} {r['recv_tokens']:>10d} "
                   f"{r['expert_count_min']:>9d} {r['expert_count_max']:>9d} {r['expert_count_avg']:>9.0f}")
 
@@ -390,7 +397,6 @@ def worker(local_rank, num_local_ranks, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--m-per-gpu", type=int, default=4096, help="Tokens per GPU")
     parser.add_argument("--hidden", type=int, default=HIDDEN_SIZE)
     parser.add_argument("--num-sms", type=int, default=24)
     parser.add_argument("--use-fp8", action="store_true", default=True)
