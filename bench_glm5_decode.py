@@ -14,7 +14,7 @@ Operator selection (sglang decode path):
     - absorbed_W_UV:       sgl_kernel.bmm_fp8
     - o_proj:              DeepGEMM fp8_gemm_nt
   MLA Decode Attention:
-    - flash_mla_with_kvcache (paged KV, FP8 or BF16 decode kernel)
+    - flash_mla_sparse_fwd (bf16 sparse attention; s_q=batch, each query gathers topk)
   DSA Indexer:
     - index_k_proj (wk):          DeepGEMM fp8_gemm_nt
     - index_q_upproj (wq_b):      DeepGEMM fp8_gemm_nt
@@ -34,7 +34,7 @@ import random
 import torch
 import deep_gemm
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
-from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
+from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 from sgl_kernel import bmm_fp8
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -181,36 +181,38 @@ def bench_sgl_bmm_fp8(batch, M, K, N, device):
     return avg_ms
 
 
-# ── MLA Decode: flash_mla_with_kvcache (paged) ──
-def bench_mla_decode(M, S, device):
-    """Decode MLA attention using flash_mla_with_kvcache with paged KV cache."""
+# ── DSA Decode: flash_mla_sparse_fwd (bf16 sparse attention) ──
+def bench_dsa_decode(M, S, device):
+    """Decode DSA sparse attention using flash_mla_sparse_fwd (bf16).
+
+    Decode contributes 1 query token per request, so the batch flattens to
+    s_q = M query tokens. Each query gathers topk indices from the s_kv KV cache.
+    The KV cache is shared across the batch as a micro-bench simplification
+    (single sequence), not per-request paged KV.
+    """
     h_q = NUM_HEADS
     h_kv = 1
     d_qk = D_QK
     d_v = D_V
+    topk = TOPK
 
-    num_blocks_per_seq = (S + BLOCK_SIZE_KV - 1) // BLOCK_SIZE_KV
-    total_blocks = num_blocks_per_seq * M
+    # q: [s_q=M, h_q, d_qk]
+    q = torch.randn(M, h_q, d_qk, dtype=torch.bfloat16, device=device)
+    # kv: [s_kv=S, h_kv, d_qk]  (shared cache across the batch)
+    kv = torch.randn(S, h_kv, d_qk, dtype=torch.bfloat16, device=device)
+    # indices: [s_q=M, h_kv, topk]
+    topk_actual = min(topk, S)
+    indices = torch.stack([
+        torch.randperm(S, device=device)[:topk_actual] for _ in range(M * h_kv)
+    ]).view(M, h_kv, topk_actual).to(torch.int32)
 
-    # q: [batch, s_q=1, h_q, d_qk]
-    q = torch.randn(M, 1, h_q, d_qk, dtype=torch.bfloat16, device=device)
-    # k_cache: [total_blocks, block_size, h_kv, d_qk]
-    k_cache = torch.randn(total_blocks, BLOCK_SIZE_KV, h_kv, d_qk, dtype=torch.bfloat16, device=device)
-    # block_table: [batch, num_blocks_per_seq]
-    block_table = torch.arange(total_blocks, dtype=torch.int32, device=device).view(M, num_blocks_per_seq)
-    # cache_seqlens: [batch]
-    cache_seqlens = torch.full((M,), S, dtype=torch.int32, device=device)
-
-    tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 1 * h_q // h_kv, h_kv)
+    sm_scale = d_qk ** -0.5
 
     def run():
-        flash_mla_with_kvcache(
-            q, k_cache, block_table, cache_seqlens, d_v,
-            tile_scheduler_metadata, num_splits, causal=False,
-        )
+        flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v)
 
     avg_ms = _cuda_graph_bench(run)
-    del q, k_cache, block_table, cache_seqlens, tile_scheduler_metadata, num_splits
+    del q, kv, indices
     return avg_ms
 
 
@@ -318,10 +320,10 @@ def get_all_operators_decode(M, S):
                 lambda dev: bench_deepgemm_fp8(M, NUM_HEADS * V_HEAD_DIM, HIDDEN_SIZE, dev),
                 f"[{M}, {NUM_HEADS * V_HEAD_DIM}]×[{NUM_HEADS * V_HEAD_DIM}, {HIDDEN_SIZE}]  (DeepGEMM FP8)"))
 
-    # ── MLA Decode Attention (paged KV cache) ──
-    ops.append(("mla_decode_attn", "MLA",
-                lambda dev, _M=M, _S=S: bench_mla_decode(_M, _S, dev),
-                f"flash_mla_with_kvcache batch={M} s_q=1 s_kv={S} paged"))
+    # ── DSA Decode Attention (sparse) ──
+    ops.append(("dsa_decode_attn", "DSA",
+                lambda dev, _M=M, _S=S: bench_dsa_decode(_M, _S, dev),
+                f"flash_mla_sparse_fwd s_q={M} s_kv={S} topk={TOPK} (decode batch)"))
 
     # ── DSA Indexer ──
     ops.append(("index_k_proj", "DSA Indexer",

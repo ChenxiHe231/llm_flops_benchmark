@@ -31,11 +31,11 @@ GLM-5 模型各算子的 CUDA 性能测试工具集，基于 DeepGEMM、sgl_kern
 
 ### 1. bench_glm5_prefill.py — Prefill 阶段全算子性能
 
-测试 sglang prefill 路径下的所有 GLM-5 算子，包括 Attention GEMM、MLA、DSA Indexer、MoE。
+测试 sglang prefill 路径下的所有 GLM-5 算子，包括 Attention GEMM、DSA、DSA Indexer、MoE。
 
 **覆盖算子：**
 - Attention: `fused_qkv_a_proj`, `q_b_proj`, `absorbed_W_UK`, `absorbed_W_UV`, `o_proj`
-- MLA: `flash_mla_with_kvcache`（paged KV cache）
+- DSA: `flash_mla_sparse_fwd`（bf16 sparse attention，s_q=M，每 query gather topk=2048）
 - DSA Indexer: `index_k_proj`, `index_q_upproj`, `index_weights_proj`, `index_score`（fp8_mqa_logits）
 - MoE: `gate_proj`, `up_proj`, `down_proj`（fp8_m_grouped_gemm_nt_masked）
 
@@ -54,9 +54,9 @@ python bench_glm5_prefill.py
 
 ### 2. bench_glm5_decode.py — Decode 阶段全算子性能
 
-测试 sglang decode 路径下的所有算子。与 prefill 的区别：M 为 batch_size（每请求 1 token），MLA 使用 decode kernel，DSA Indexer 使用 `fp8_paged_mqa_logits`。
+测试 sglang decode 路径下的所有算子。与 prefill 的区别：M 为 batch_size（每请求 1 token），batch flatten 成 s_q=M，attention 同样使用 DSA sparse kernel（`flash_mla_sparse_fwd`），DSA Indexer 使用 `fp8_paged_mqa_logits`。
 
-**覆盖算子：** 同 prefill，但使用 decode 版本的 MLA 和 indexer score。
+**覆盖算子：** 同 prefill，但 attention 为 decode 形态的 DSA sparse（s_q=batch），indexer score 使用 decode 版本的 `fp8_paged_mqa_logits`。
 
 **参数：**
 - `M`（batch_size）：默认 [1, 4, 8, 16, 32, 64]
