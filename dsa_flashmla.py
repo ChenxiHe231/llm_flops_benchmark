@@ -8,11 +8,12 @@ After matrix absorption:
   h_q=64, h_kv=1, d_qk=576, d_v=512, topk=2048
 
 Scenario:
-  Sparse prefill over the full context; sweep context length S.
-  - s_q  = S   (query tokens, = full context)
-  - s_kv = S   (KV cache, = full context)
+  Sparse prefill; s_q and s_kv are configured independently and swept as a
+  cartesian product (no KV cache hit-rate modeling).
+  - s_q  ∈ SQ_LIST   (query tokens, independent)
+  - s_kv ∈ SKV_LIST  (KV cache length, independent)
   - topk = 2048 (fixed)
-  Each query gathers topk keys from the s_kv cache (no KV cache hit-rate modeling).
+  Each query gathers topk keys from the s_kv cache.
 
 API:
   flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v)
@@ -38,7 +39,8 @@ D_V = 512        # kv_lora_rank
 TOPK = 2048      # index_topk
 SM_SCALE = D_QK ** -0.5
 
-S_LIST = [16384, 32768, 65536, 131072]
+SQ_LIST = [16384, 32768, 65536, 131072]
+SKV_LIST = [16384, 32768, 65536, 131072]
 
 NUM_WARMUP = 5
 NUM_RUNS = 20
@@ -119,9 +121,10 @@ def main():
     print("GLM-5 FlashMLA Sparse Prefill Benchmark")
     print("=" * 90)
     print(f"Model:    h_q={H_Q}, h_kv={H_KV}, d_qk={D_QK}, d_v={D_V}, topk={TOPK}")
-    print(f"S list:   {S_LIST}")
+    print(f"SQ list:  {SQ_LIST}")
+    print(f"SKV list: {SKV_LIST}")
     print(f"Bench:    {num_warmup} warmup + {num_runs} runs per case")
-    print(f"Logic:    s_q = s_kv = S, topk={TOPK} (fixed)")
+    print(f"Logic:    s_q ∈ SQ_LIST × s_kv ∈ SKV_LIST, topk={TOPK} (fixed)")
     print("=" * 90)
 
     header = f"{'s_q':>8s} {'s_kv':>8s} {'topk':>6s} {'avg(ms)':>10s} {'min(ms)':>10s} {'max(ms)':>10s} {'TFlops':>10s} {'TB/s':>10s} {'F/B':>8s}"
@@ -130,43 +133,42 @@ def main():
 
     results = []
 
-    for S in S_LIST:
-        s_q = S
-        s_kv = S
-        topk = TOPK
+    for s_kv in SKV_LIST:
+        for s_q in SQ_LIST:
+            topk = TOPK
 
-        torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
-        try:
-            avg_ms, min_ms, max_ms, tflops, tbps, fpb = bench_one(s_q, s_kv, topk, device)
-            print(f"{s_q:>8d} {s_kv:>8d} {topk:>6d} {avg_ms:>10.3f} {min_ms:>10.3f} {max_ms:>10.3f} {tflops:>10.1f} {tbps:>10.3f} {fpb:>8.1f}")
-            results.append({
-                "s_q": s_q,
-                "s_kv": s_kv,
-                "topk": topk,
-                "avg_ms": avg_ms,
-                "min_ms": min_ms,
-                "max_ms": max_ms,
-                "tflops": tflops,
-                "tbps": tbps,
-                "flops_per_byte": fpb,
-            })
-        except Exception as e:
-            print(f"{s_q:>8d} {s_kv:>8d} {topk:>6d}   FAILED: {e}")
-            results.append({
-                "s_q": s_q,
-                "s_kv": s_kv,
-                "topk": topk,
-                "avg_ms": 0,
-                "min_ms": 0,
-                "max_ms": 0,
-                "tflops": 0,
-                "tbps": 0,
-                "flops_per_byte": 0,
-                "error": str(e),
-            })
+            try:
+                avg_ms, min_ms, max_ms, tflops, tbps, fpb = bench_one(s_q, s_kv, topk, device)
+                print(f"{s_q:>8d} {s_kv:>8d} {topk:>6d} {avg_ms:>10.3f} {min_ms:>10.3f} {max_ms:>10.3f} {tflops:>10.1f} {tbps:>10.3f} {fpb:>8.1f}")
+                results.append({
+                    "s_q": s_q,
+                    "s_kv": s_kv,
+                    "topk": topk,
+                    "avg_ms": avg_ms,
+                    "min_ms": min_ms,
+                    "max_ms": max_ms,
+                    "tflops": tflops,
+                    "tbps": tbps,
+                    "flops_per_byte": fpb,
+                })
+            except Exception as e:
+                print(f"{s_q:>8d} {s_kv:>8d} {topk:>6d}   FAILED: {e}")
+                results.append({
+                    "s_q": s_q,
+                    "s_kv": s_kv,
+                    "topk": topk,
+                    "avg_ms": 0,
+                    "min_ms": 0,
+                    "max_ms": 0,
+                    "tflops": 0,
+                    "tbps": 0,
+                    "flops_per_byte": 0,
+                    "error": str(e),
+                })
 
-        time.sleep(0.3)
+            time.sleep(0.3)
 
     print("=" * len(header))
 
