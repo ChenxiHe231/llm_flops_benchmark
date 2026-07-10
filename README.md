@@ -113,23 +113,40 @@ python bench_glm5_deepep.py --nnodes 1 --scenario balanced
 
 ### 4. dsa_flashmla.py — FlashMLA Sparse Prefill 性能
 
-测试 DSA（Dynamic Sparse Attention）中的 sparse prefill 算子 `flash_mla_sparse_fwd`，模拟不同的 KV cache 命中率。
+测试 DSA（Dynamic Sparse Attention）中的 sparse prefill 算子 `flash_mla_sparse_fwd`，扫描不同上下文长度。该算子对全量上下文做稀疏 prefill，不涉及 KV cache 命中率。
 
 **场景：**
-- 总上下文 65536 tokens
-- KV cache 命中率从 0% 到 90%（命中部分不需要 sparse prefill）
-- `s_q = 65536 * (1 - hit_rate)`
+- 扫描上下文长度 S：`[16384, 32768, 65536, 131072]`
+- `s_q = s_kv = S`，`topk = 2048`（固定）
+- 每个 query 从 s_kv cache 中 gather topk 个 key
 
 **运行：**
 ```bash
 python dsa_flashmla.py
 ```
 
-**输出：** 各命中率下的延迟（ms）、TFlops、TB/s、计算访存比，CSV 保存到 `glm5_sparse_prefill_perf.csv`。
+**输出：** 各上下文长度下的延迟（ms）、TFlops、TB/s、计算访存比，CSV 保存到 `glm5_sparse_prefill_perf.csv`。
 
 ---
 
-### 5. dsa_indexer.py — DSA Indexer GEMM (cuBLAS FP8) 性能
+### 5. mla_flashmla.py — FlashMLA Dense Prefill (传统 MLA) 性能
+
+测试传统 MLA 的 dense prefill 算子 `flash_mla_with_kvcache`（paged KV cache，非稀疏）。与 `dsa_flashmla.py` 的区别：去掉稀疏（topk/indices），每个 query 对全部 s_kv 做 dense attention。除 topk 外的参数与 DSA 完全一致，同样扫描上下文长度，不涉及命中率。
+
+**场景：**
+- 扫描上下文长度 S：`[16384, 32768, 65536, 131072]`
+- `s_q = s_kv = S`（dense，无 topk）
+
+**运行：**
+```bash
+python mla_flashmla.py
+```
+
+**输出：** 各上下文长度下的延迟（ms）、TFlops、TB/s、计算访存比，CSV 保存到 `glm5_dense_prefill_perf.csv`。
+
+---
+
+### 6. dsa_indexer.py — DSA Indexer GEMM (cuBLAS FP8) 性能
 
 单独测试 DSA Indexer 的 4 个 GEMM 算子，使用 `torch._scaled_mm`（cuBLAS FP8）。
 
@@ -152,7 +169,7 @@ python dsa_indexer.py
 
 ---
 
-### 6. dsa_projection.py — Attention GEMM/BMM (DeepGEMM FP8) 性能
+### 7. dsa_projection.py — Attention GEMM/BMM (DeepGEMM FP8) 性能
 
 单独测试 MLA attention 中的 6 个 GEMM/BMM 算子，使用 DeepGEMM FP8。
 
@@ -176,7 +193,7 @@ python dsa_projection.py
 
 ---
 
-### 7. moe_deepgemm.py — MoE Grouped GEMM (DeepGEMM FP8) 性能
+### 8. moe_deepgemm.py — MoE Grouped GEMM (DeepGEMM FP8) 性能
 
 单独测试 MoE FFN 的 grouped GEMM（contiguous layout），使用 `deep_gemm.m_grouped_fp8_gemm_nt_contiguous`。测试多种随机 token 分布。
 
@@ -209,7 +226,8 @@ NUM_RUNS=50 NUM_DISTRIBUTIONS=10 python moe_deepgemm.py
 | `bench_glm5_prefill.py` | 端到端 prefill | 评估单层 prefill 总耗时和瓶颈 |
 | `bench_glm5_decode.py` | 端到端 decode | 评估单层 decode 总耗时和瓶颈 |
 | `bench_glm5_deepep.py` | 通信 | 评估 MoE EP 通信开销 |
-| `dsa_flashmla.py` | 单算子 | 评估 sparse attention 随命中率的变化 |
+| `dsa_flashmla.py` | 单算子 | 评估 sparse attention 随上下文长度的变化 |
+| `mla_flashmla.py` | 单算子 | 评估 dense MLA attention 随上下文长度的变化 |
 | `dsa_indexer.py` | 单算子 | 评估 DSA indexer 各 GEMM（cuBLAS） |
 | `dsa_projection.py` | 单算子 | 评估 attention GEMM/BMM（DeepGEMM） |
 | `moe_deepgemm.py` | 单算子 | 评估 MoE grouped GEMM 不同分布下性能 |

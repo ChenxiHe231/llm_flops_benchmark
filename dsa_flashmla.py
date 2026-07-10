@@ -8,11 +8,11 @@ After matrix absorption:
   h_q=64, h_kv=1, d_qk=576, d_v=512, topk=2048
 
 Scenario:
-  Total context = 65536 (64K).
-  Prefix KV Cache hit rate from 0% to 90%.
-  - s_kv = 65536 (fixed, full KV cache always participates)
-  - s_q  = 65536 * (1 - hit_rate)  (cache-miss tokens needing sparse prefill)
+  Sparse prefill over the full context; sweep context length S.
+  - s_q  = S   (query tokens, = full context)
+  - s_kv = S   (KV cache, = full context)
   - topk = 2048 (fixed)
+  Each query gathers topk keys from the s_kv cache (no KV cache hit-rate modeling).
 
 API:
   flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v)
@@ -36,10 +36,9 @@ H_KV = 1
 D_QK = 576       # kv_lora_rank(512) + qk_rope_head_dim(64)
 D_V = 512        # kv_lora_rank
 TOPK = 2048      # index_topk
-TOTAL_LEN = 65536
 SM_SCALE = D_QK ** -0.5
 
-HIT_RATES = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
+S_LIST = [16384, 32768, 65536, 131072]
 
 NUM_WARMUP = 5
 NUM_RUNS = 20
@@ -120,33 +119,28 @@ def main():
     print("GLM-5 FlashMLA Sparse Prefill Benchmark")
     print("=" * 90)
     print(f"Model:    h_q={H_Q}, h_kv={H_KV}, d_qk={D_QK}, d_v={D_V}, topk={TOPK}")
-    print(f"Context:  {TOTAL_LEN} tokens (64K)")
+    print(f"S list:   {S_LIST}")
     print(f"Bench:    {num_warmup} warmup + {num_runs} runs per case")
-    print(f"Logic:    s_kv={TOTAL_LEN} (fixed), s_q={TOTAL_LEN}*(1-hit_rate)")
+    print(f"Logic:    s_q = s_kv = S, topk={TOPK} (fixed)")
     print("=" * 90)
 
-    header = f"{'hit%':>6s} {'s_q':>8s} {'s_kv':>8s} {'topk':>6s} {'avg(ms)':>10s} {'min(ms)':>10s} {'max(ms)':>10s} {'TFlops':>10s} {'TB/s':>10s} {'F/B':>8s}"
+    header = f"{'s_q':>8s} {'s_kv':>8s} {'topk':>6s} {'avg(ms)':>10s} {'min(ms)':>10s} {'max(ms)':>10s} {'TFlops':>10s} {'TB/s':>10s} {'F/B':>8s}"
     print(header)
     print("-" * len(header))
 
     results = []
 
-    for hit_rate in HIT_RATES:
-        s_q = int(TOTAL_LEN * (1 - hit_rate / 100))
-        s_kv = TOTAL_LEN
+    for S in S_LIST:
+        s_q = S
+        s_kv = S
         topk = TOPK
-
-        if s_q == 0:
-            print(f"{hit_rate:>5d}%  (skip: s_q=0, full cache hit)")
-            continue
 
         torch.cuda.empty_cache()
 
         try:
             avg_ms, min_ms, max_ms, tflops, tbps, fpb = bench_one(s_q, s_kv, topk, device)
-            print(f"{hit_rate:>5d}% {s_q:>8d} {s_kv:>8d} {topk:>6d} {avg_ms:>10.3f} {min_ms:>10.3f} {max_ms:>10.3f} {tflops:>10.1f} {tbps:>10.3f} {fpb:>8.1f}")
+            print(f"{s_q:>8d} {s_kv:>8d} {topk:>6d} {avg_ms:>10.3f} {min_ms:>10.3f} {max_ms:>10.3f} {tflops:>10.1f} {tbps:>10.3f} {fpb:>8.1f}")
             results.append({
-                "hit_rate": hit_rate,
                 "s_q": s_q,
                 "s_kv": s_kv,
                 "topk": topk,
@@ -158,9 +152,8 @@ def main():
                 "flops_per_byte": fpb,
             })
         except Exception as e:
-            print(f"{hit_rate:>5d}% {s_q:>8d} {s_kv:>8d} {topk:>6d}   FAILED: {e}")
+            print(f"{s_q:>8d} {s_kv:>8d} {topk:>6d}   FAILED: {e}")
             results.append({
-                "hit_rate": hit_rate,
                 "s_q": s_q,
                 "s_kv": s_kv,
                 "topk": topk,
@@ -180,13 +173,12 @@ def main():
     # CSV output
     csv_path = "glm5_sparse_prefill_perf.csv"
     with open(csv_path, "w") as f:
-        f.write("hit_rate_pct,s_q,s_kv,topk,h_q,d_qk,d_v,avg_ms,min_ms,max_ms,tflops,tbps,flops_per_byte\n")
+        f.write("s_q,s_kv,topk,h_q,d_qk,d_v,avg_ms,min_ms,max_ms,tflops,tbps,flops_per_byte\n")
         for r in results:
-            f.write(f"{r['hit_rate']},{r['s_q']},{r['s_kv']},{r['topk']},{H_Q},{D_QK},{D_V},"
+            f.write(f"{r['s_q']},{r['s_kv']},{r['topk']},{H_Q},{D_QK},{D_V},"
                     f"{r['avg_ms']:.4f},{r['min_ms']:.4f},{r['max_ms']:.4f},{r['tflops']:.2f},{r['tbps']:.4f},{r['flops_per_byte']:.2f}\n")
     print(f"\nResults saved to {csv_path}")
 
 
 if __name__ == "__main__":
     main()
-
