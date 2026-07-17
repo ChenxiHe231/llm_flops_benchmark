@@ -13,20 +13,26 @@
 | dsa_attn | `sgl_kernel.flash_mla_sparse_fwd` |
 | index_score | prefill `fp8_mqa_logits` / decode `fp8_paged_mqa_logits` |
 
+## 依赖
+
+需要一个装好 `torch` / `deep_gemm` / `sgl_kernel`(含 `flash_mla`)的 Python 环境(如 SGLang 镜像里的环境),且有一块可见 GPU(Blackwell/B200,因为 deep_gemm 的 fp8 GEMM 走 UE8M0)。
+
 ## 用法
 
 ```bash
-PY=/home/hechenxi/miniconda3/bin/python
-cd /home/hechenxi/llm_flops/opbench
+# 用你自己装了 deep_gemm/sgl_kernel/flash_mla 的 python
+cd opbench
 
 # 正确性:真实后端 vs candidate,同一份 frozen 输入,cosine >= 阈值
-$PY verify.py  --op fused_qkv_a --M 4096
+python verify.py  --op fused_qkv_a --M 4096
 
 # latency:真实后端 baseline(有 candidate 则一并给 speedup)
-$PY latency.py --op dsa_attn --M 32
+python latency.py --op dsa_attn --M 32
 
 # MFU + 带宽利用率(自动标 compute/memory-bound)
-$PY mfu.py     --op q_b --M 4096
+python mfu.py     --op q_b --M 4096
+
+# 指定 GPU:加 --device cuda:N(默认 cuda:0)
 ```
 
 ## candidate 怎么接入
