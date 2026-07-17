@@ -1,8 +1,12 @@
 """FP8 quantization helpers (verbatim from bench_glm5_decode.py) + TMA-align import.
 
-All three quant recipes produce plain e4m3 blockwise/per-tensor scales (the
-"dequant multiplier" convention: scale = amax / fp8_max, kernel multiplies back).
-This matches the existing bench口径 (NOT UE8M0 — a deliberate choice).
+All three helpers produce plain e4m3 scales (the "dequant multiplier"
+convention: scale = amax / fp8_max, kernel multiplies back). SCOPE: only
+cast_to_fp8_per_tensor is used by the harness — for the bmm_fp8 path (see
+specs.py _build_bmm). The gemm/moe paths do NOT use these plain-e4m3 helpers;
+they use the UE8M0 variants from deep_gemm.utils.math (pow-2 scales required by
+Blackwell fp8_gemm_nt / fp8_m_grouped_gemm_nt_masked). per_token_cast_to_fp8 /
+per_block_cast_to_fp8 are kept (not deleted) so a candidate can import them.
 """
 import torch
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # re-export

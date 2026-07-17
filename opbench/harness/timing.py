@@ -37,7 +37,10 @@ def time_callable(fn, num_warmup=NUM_WARMUP, num_runs=NUM_RUNS):
         del graph
         return avg_ms
     except Exception:
-        # Fallback: non-graph event timing (still excludes python loop via sync).
+        # Fallback: non-graph event timing. The CUDA events bracket the WHOLE
+        # python for-loop, so per-launch dispatch overhead IS included here
+        # (unlike the graph path). Small-kernel latency is overestimated vs the
+        # graph path.
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize()

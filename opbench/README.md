@@ -13,6 +13,8 @@
 | dsa_attn | `sgl_kernel.flash_mla_sparse_fwd` |
 | index_score | prefill `fp8_mqa_logits` / decode `fp8_paged_mqa_logits` |
 
+> **覆盖范围说明**:这 12 个算子 **不等于** 完整 DSA layer。未建模:`index_weights_proj`(bf16 `deep_gemm.bf16_gemm_nt`)以及小 batch(M≤16)下 `fused_qkv_a` 走的 BF16 融合 `dsv3_fused_a_gemm` 路径。这与 `bench_glm5_*.py` 的口径一致。
+
 ## 依赖
 
 需要一个装好 `torch` / `deep_gemm` / `sgl_kernel`(含 `flash_mla`)的 Python 环境(如 SGLang 镜像里的环境),且有一块可见 GPU(Blackwell/B200,因为 deep_gemm 的 fp8 GEMM 走 UE8M0)。

@@ -16,7 +16,7 @@ from sgl_kernel import bmm_fp8
 from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
 from .quant import (
-    per_token_cast_to_fp8, per_block_cast_to_fp8, cast_to_fp8_per_tensor,
+    cast_to_fp8_per_tensor,
     get_mn_major_tma_aligned_tensor,
 )
 # Canonical UE8M0 quant (Blackwell fp8_gemm_nt/moe require pow-2 scales; this
@@ -119,8 +119,14 @@ def _build_gemm(op, phase, M, S, device):
     x_scale = get_mn_major_tma_aligned_tensor(x_scale)
     w_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
     w_fp8, w_scale = dg_per_block_cast(w_bf16, use_ue8m0=True)
+    # Pre-allocate the output once so it is NOT re-allocated inside the timed
+    # callable (CUDA-graph replay / fallback path would otherwise count the
+    # alloc per iter). NOTE: reference() writes into this SHARED buffer, so
+    # verify.py clones ref_out before running the candidate (else a candidate
+    # writing inputs["out"] would alias ref_out and cosine would falsely be 1.0).
+    out = torch.empty(rows, N, dtype=torch.bfloat16, device=device)
     return dict(x_fp8=x_fp8, x_scale=x_scale, w_fp8=w_fp8, w_scale=w_scale,
-                rows=rows, N=N, device=device)
+                rows=rows, N=N, device=device, out=out)
 
 
 def _build_bmm(op, M, device):
@@ -157,8 +163,12 @@ def _build_moe(op, M, device):
     for _ in range(total_m):
         counts[random.randint(0, E - 1)] += 1
     masked_m = torch.tensor(counts, dtype=torch.int32, device=device)
+    # Pre-allocate output once (see _build_gemm note; verify.py clones ref_out).
+    # rows dim is expected_m, matching x_fp8.shape[1].
+    out = torch.empty(E, expected_m, N, dtype=torch.bfloat16, device=device)
     return dict(x_fp8=x_fp8, x_scale=x_scale, w_fp8=w_fp8, w_scale=w_scale,
-                masked_m=masked_m, expected_m=expected_m, E=E, N=N, device=device)
+                masked_m=masked_m, expected_m=expected_m, E=E, N=N, device=device,
+                out=out)
 
 
 def _build_mla(M, S, device):
@@ -184,6 +194,12 @@ def _build_score(phase, M, S, device):
         k_fp8 = (k_view.float() / k_scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view(S, INDEX_HEAD_DIM)
         k_scale = k_scale.squeeze(-1)
         weights = torch.randn(M, INDEX_N_HEADS, dtype=torch.float32, device=device)
+        # FIX C: fp8_mqa_logits takes NO separate q scale; real sglang folds the
+        # per-token q_scale (and the index softmax_scale = head_dim**-0.5) into
+        # `weights` before the call (dsa_indexer.py). q_scale is [M, N_HEADS, 1]
+        # here (head_dim//128 == 1); squeeze the trailing dim -> [M, N_HEADS].
+        softmax_scale = INDEX_HEAD_DIM ** -0.5
+        weights = weights * q_scale.squeeze(-1) * softmax_scale
         ks = torch.zeros(M, dtype=torch.int32, device=device)
         ke = torch.full((M,), S, dtype=torch.int32, device=device)
         return dict(q_fp8=q_fp8, k_fp8=k_fp8, k_scale=k_scale, weights=weights, ks=ks, ke=ke)
@@ -195,6 +211,11 @@ def _build_score(phase, M, S, device):
     q_scale = (q_view.abs().float().amax(dim=-1) / 448.0).clamp(min=1e-12)
     q_fp8 = (q_view.float() / q_scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view(
         M, 1, INDEX_N_HEADS, INDEX_HEAD_DIM)
+    # FIX C: fold per-token q_scale into weights (fp8_paged_mqa_logits takes no
+    # separate q scale; real sglang folds it, see dsa_indexer.py). q_view was
+    # [M*N_HEADS, head_dim//128, 128] so q_scale is [M*N_HEADS, 1]; the flatten
+    # order is (m-major, head-minor), so .view(M, N_HEADS) aligns with weights.
+    q_scale_hw = q_scale.view(M, INDEX_N_HEADS)
     head_dim_with_sf = 132
     # 128 fp8 data bytes + 4 scale bytes (one f32). Build from REAL fp8-quantized
     # data (finite) + scale=1.0, so logits are finite (random uint8 would yield
@@ -205,6 +226,8 @@ def _build_score(phase, M, S, device):
                     device=device).view(torch.uint8).reshape(total_blocks, BLOCK_SIZE_KV, 1, 4)
     kv_cache_fp8 = torch.cat([data, sf], dim=-1).contiguous()  # [total_blocks,64,1,132] uint8
     weights = torch.randn(M, INDEX_N_HEADS, dtype=torch.float32, device=device)
+    softmax_scale = INDEX_HEAD_DIM ** -0.5
+    weights = weights * q_scale_hw * softmax_scale
     seqlens = torch.full((M, 1), S, dtype=torch.int32, device=device)  # 2D: [batch, next_n]
     block_tables = torch.arange(total_blocks, dtype=torch.int32, device=device).view(M, nbps)
     max_seq_len = nbps * BLOCK_SIZE_KV
@@ -221,7 +244,7 @@ def _build_score(phase, M, S, device):
 def reference(op: str, phase: str, inputs: dict):
     fam = family(op)
     if fam == "gemm":
-        out = torch.empty(inputs["rows"], inputs["N"], dtype=torch.bfloat16, device=inputs["device"])
+        out = inputs["out"]
         deep_gemm.fp8_gemm_nt((inputs["x_fp8"], inputs["x_scale"]),
                               (inputs["w_fp8"], inputs["w_scale"]), out)
         return out
@@ -229,8 +252,7 @@ def reference(op: str, phase: str, inputs: dict):
         return bmm_fp8(inputs["A_fp8"], inputs["B_fp8"],
                        inputs["A_scale"], inputs["B_scale"], torch.bfloat16)
     if fam == "moe":
-        out = torch.empty(inputs["E"], inputs["x_fp8"].shape[1], inputs["N"],
-                          dtype=torch.bfloat16, device=inputs["device"])
+        out = inputs["out"]
         deep_gemm.fp8_m_grouped_gemm_nt_masked((inputs["x_fp8"], inputs["x_scale"]),
                                                (inputs["w_fp8"], inputs["w_scale"]),
                                                out, inputs["masked_m"], inputs["expected_m"])
@@ -290,6 +312,10 @@ def bytes_(op: str, phase: str, M: int, S: int) -> float:
         return eff * K * 1 + N_EXPERT * N * K * 1 + eff * N * 2
     if fam == "mla":
         sq = M
+        # Assumes cross-query KV reuse: shared KV counted once, capped at S.
+        # Exact when TOPK*sq <= S (true for decode M<=32 at S=65536). When
+        # TOPK*sq > S the cap makes this UNDERESTIMATE KV bytes, biasing the
+        # reported bandwidth-util LOW.
         kv_tokens = min(TOPK * sq, S)
         return 2.0 * (NUM_HEADS * sq * D_QK + kv_tokens * D_QK + NUM_HEADS * sq * D_V)
     # score

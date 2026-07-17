@@ -30,6 +30,11 @@ def main():
     run_cand, src = load_candidate(args.op, phase)
 
     ref_out = specs.reference(args.op, phase, inputs)
+    # reference() may write into the SHARED inputs["out"] buffer (gemm/moe), so
+    # clone BEFORE the candidate runs — otherwise a candidate that also writes
+    # inputs["out"] would alias ref_out and cosine would falsely be ~1.0.
+    # (mla reference returns a tuple; clone each tensor.)
+    ref_out = ref_out.clone() if torch.is_tensor(ref_out) else tuple(t.clone() for t in ref_out)
     cand_out = run_cand(inputs)
     cos = compare.compare(ref_out, cand_out, meta["output_kind"], inputs)
 
