@@ -1,7 +1,16 @@
 # opbench — GLM-5 算子级 baseline / 验证框架
 
-对 12 个 GLM-5 算子,按 **(算子 × 相位 × M) = task** 提供三件套:正确性(cosine)、latency、MFU/带宽利用率。
-每个 task 传入 `(--op, --M)`,相位从 M 自动推断(prefill M∈{1024,2048,4096} / decode M∈{16,32}),S 默认 65536。
+对 12 个 GLM-5 算子,按 **(算子 × 相位 × M) = task** 提供:单算子的正确性(cosine)/ latency / MFU,以及全层端到端 latency。
+每个脚本传入 `--op --M`(`allLatency` 只需 `--M`),相位从 M 自动推断(prefill M∈{1024,2048,4096} / decode M∈{16,32}),S 默认 65536。
+
+## 四个脚本
+
+| 脚本 | 作用 | 粒度 |
+|---|---|---|
+| `verify.py` | 真实后端 vs candidate,同一份 frozen 输入,cosine ≥ 阈值 | 单算子 |
+| `latency.py` | 真实后端 baseline(有 candidate 则给 speedup) | 单算子 |
+| `mfu.py` | MFU + 带宽利用率(自动标 compute/memory-bound) | 单算子 |
+| `allLatency.py` | 全层所有算子跑一遍、按耗时排序 + 层总延迟,有 candidate 的换 candidate | 全层端到端 |
 
 ## 12 算子 → 真实后端
 
@@ -34,15 +43,31 @@ python latency.py --op dsa_attn --M 32
 # MFU + 带宽利用率(自动标 compute/memory-bound)
 python mfu.py     --op q_b --M 4096
 
+# 全层端到端:所有算子跑一遍,有 candidate 的换 candidate,出层总延迟 + 端到端 delta
+python allLatency.py --M 32                 # decode 层,所有 candidate 生效
+python allLatency.py --M 4096               # prefill 层
+python allLatency.py --M 32 --op o_proj     # 只 o_proj 用 candidate,其余 backend(隔离单个 candidate 的影响)
+
 # 指定 GPU:加 --device cuda:N(默认 cuda:0)
 ```
+
+## 计时方式(默认对齐 kernel-harness)
+
+`latency.py` / `allLatency.py` 有两种计时,`--timing` 选择:
+
+- **`kh`(默认)** —— kernel-harness 口径:**每轮 flush L2 + 重新 clone 输入 + median CUDA-event**。cold-cache,更贴近真实 serving(权重在层间已被冲出 L2,每次都要从 HBM 冷读),数字可和 best-kernels reward bench 比。cupti 装了会自动升级到设备端 kernel 时间。
+- **`graph`** —— 原始 CUDA-graph、warm-L2、mean。快,但会**美化 memory-bound 算子**(复用了缓存的权重,隐藏真实 HBM 流量)。仅作快速 sanity。
+
+> 同一个 candidate 两种口径可能给出**相反**结论:例如 o_proj 的 compiled_dims 变体在 `graph` 下 1.07x(看着快),在 `kh` 下 ~0.98x(其实略慢)——那个"加速"只存在于缓存命中的假象里。评分/排名一律用 `kh`。
 
 ## candidate 怎么接入
 
 把 `tasks/_template_impl.py` 拷到 `tasks/{算子}/{相位}/impl.py`,实现 `run(inputs)->out`。
 - harness **拥有输入生成**:同一份量化好的 fp8 输入同时喂真实后端和 candidate(公平对比结构性保证)。
 - candidate **禁止**重新量化 / 重新 seed / 造新随机数。
-- **不写 impl.py 时,三个脚本自动测真实后端 baseline**(verify 得 cosine≈1)。
+- **不写 impl.py 时,脚本自动测真实后端 baseline**(verify 得 cosine≈1)。
+- `tasks/{算子}/{相位}/` 下的 candidate 被 `.gitignore` 排除(属于具体接入产物,不进框架仓库);模板 `tasks/_template_impl.py` 保留。
+- candidate 的实现(别处生成的 kernel)常需薄适配:拆 `inputs` dict → 位置参数,必要时把 opbench 的 float32 UE8M0 scale 重打包成 kernel 需要的格式(见已有 `tasks/*/impl.py` 例子)。
 
 ## 阈值(分层)
 
